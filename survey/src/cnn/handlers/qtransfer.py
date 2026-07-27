@@ -1,74 +1,74 @@
 """Data / training helpers for the `Quantumnet` port (`cnn/models/qtransfer.py`), mirroring the
 shipped config in `XanaduAI/quantum-transfer-learning`'s
-`c2q_transfer_learning_ants_bees.ipynb`.
+`c2q_transfer_learning_ants_bees.ipynb`, but trained on **BreastMNIST** instead of the original's
+ants-vs-bees `ImageFolder` set, matching every other notebook in this folder
+(`qcnn.ipynb`, `quonv.ipynb`).
 
-- ``download_hymenoptera``: fetches and extracts the torchvision "hymenoptera_data" (ants vs.
-  bees) zip the notebook instructs the reader to download by hand.
-- ``build_hymenoptera_datasets``: the notebook's `data_transforms` dict (`Resize(256)`,
-  `CenterCrop(224)`, `ToTensor`, ImageNet normalization -- augmentation left commented out in the
-  original, so not applied here either) plus `datasets.ImageFolder`.
+- ``build_breastmnist_datasets``: BreastMNIST's native 28x28 grayscale images, replicated to 3
+  channels and resized/normalized the same way the original's `data_transforms` prepares its RGB
+  ants/bees images (`Resize(256)`, `CenterCrop(224)`, ImageNet normalization) -- required because
+  `resnet18(pretrained=True)` expects 3-channel ImageNet-statistics input regardless of the
+  downstream task.
 - ``HybridResNet``: `resnet18(pretrained=True)` with every parameter frozen and `.fc` replaced by
   `Quantumnet`, exactly `model_hybrid.fc = Quantumnet()` in the notebook.
 - ``train_hybrid``: `train_model`'s train/val loop -- `StepLR` stepped once per epoch, best
   weights (by val accuracy) restored at the end.
-- ``RawImageDataset`` / ``HybridLogits``: same adapter pair as `cnn/handlers/qcnn.py`'s
-  ``RawImageDataset`` / ``QCNNLogits``, letting `_handlers.evaluation.evaluate_all_metrics` (the
-  same all-metrics helper every notebook in this folder uses) run against the hybrid model.
+- ``HybridLogits``: same adapter role as `cnn/handlers/qcnn.py`'s ``QCNNLogits``, letting
+  `_handlers.evaluation.evaluate_all_metrics` (the same all-metrics helper every notebook in this
+  folder uses) run against the hybrid model.
 """
 import copy
-import os
-import zipfile
 
-import requests
 import torch
 import torch.nn as nn
-import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset
 
 from cnn.models.qtransfer import Quantumnet
 
-HYMENOPTERA_URL = 'https://download.pytorch.org/tutorial/hymenoptera_data.zip'
-
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-def download_hymenoptera(root='./data'):
-    """Download and extract hymenoptera_data (ants vs. bees) into `root`, if not already there."""
-    target = os.path.join(root, 'hymenoptera_data')
-    if os.path.isdir(target):
-        return target
-
-    os.makedirs(root, exist_ok=True)
-    zip_path = os.path.join(root, 'hymenoptera_data.zip')
-    with requests.get(HYMENOPTERA_URL, stream=True) as r:
-        r.raise_for_status()
-        with open(zip_path, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(root)
-    os.remove(zip_path)
-    return target
+def _to_rgb_uint8(images):
+    """images: (B, 28, 28) or (B, 1, 28, 28) uint8/float -> (B, 1, 28, 28) float in [0, 1]."""
+    return images.reshape(images.size(0), 1, 28, 28).float() / 255.
 
 
-def build_hymenoptera_datasets(data_dir):
-    """`data_transforms`: deterministic resize/crop/normalize, matching the original (data
-    augmentation is present in the source but commented out, so it is not applied here either).
+class BreastMNISTRGBDataset(Dataset):
+    """Wraps a medmnist BreastMNIST ``(imgs, labels)`` numpy pair, replicating the single
+    grayscale channel to 3 and applying the original's `data_transforms` (`Resize(256)`,
+    `CenterCrop(224)`, ImageNet normalization) so a pretrained `resnet18` can consume it, matching
+    the shapes/statistics its ImageNet weights expect.
     """
-    transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
-    image_datasets = {
-        phase: datasets.ImageFolder(os.path.join(data_dir, phase), transform)
-        for phase in ('train', 'val')
-    }
-    return image_datasets
+
+    def __init__(self, imgs, labels):
+        self.imgs = torch.as_tensor(imgs, dtype=torch.float32)
+        self.labels = torch.as_tensor(labels).reshape(-1).long()
+        self.transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+
+    def __len__(self):
+        return self.imgs.size(0)
+
+    def __getitem__(self, index):
+        img = _to_rgb_uint8(self.imgs[index].unsqueeze(0)).squeeze(0).expand(3, 28, 28)
+        return self.transform(img), self.labels[index]
+
+
+def build_breastmnist_datasets(root='./data'):
+    """Downloads BreastMNIST (via medmnist) and wraps each split as a `BreastMNISTRGBDataset`."""
+    import os
+
+    from medmnist import BreastMNIST
+
+    os.makedirs(root, exist_ok=True)   # BreastMNIST() checks root exists *before* downloading
+    raw = {phase: BreastMNIST(split=phase, download=True, root=root) for phase in ('train', 'val')}
+    return {phase: BreastMNISTRGBDataset(raw[phase].imgs, raw[phase].labels) for phase in raw}
 
 
 class HybridResNet(nn.Module):
@@ -140,22 +140,6 @@ def train_hybrid(model, criterion, optimizer, scheduler, dataloaders, dataset_si
     model.load_state_dict(best_model_wts)
     print(f'Finished training. Best val accuracy: {best_acc:.4f}')
     return model
-
-
-class RawImageDataset(Dataset):
-    """Wraps an `ImageFolder`'s underlying samples so `evaluate_all_metrics` gets `(image, label)`
-    pairs with the same transform used for training/validation -- a thin pass-through, since
-    `ImageFolder` already returns exactly that.
-    """
-
-    def __init__(self, image_folder_dataset):
-        self.dataset = image_folder_dataset
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, index):
-        return self.dataset[index]
 
 
 class HybridLogits(nn.Module):
