@@ -9,9 +9,14 @@ config in `PlanQK/variational-quanvolutional-neural-networks`'s `generate_experi
   `Parameter` in that mode, so this is a no-op safety check, not the actual freeze).
 - ``train_quonv``: `Learner.train`'s loop — plain mini-batch SGD via Adam and cross-entropy,
   capped at `steps_in_epoch` steps per epoch like the original's early `break`.
+- ``RawImageDataset`` / ``QuonvLogits``: same adapter pair as `cnn/handlers/qcnn.py`'s
+  ``RawImageDataset`` / ``QCNNLogits``, letting `_handlers.evaluation.evaluate_all_metrics` (the
+  same all-metrics helper every notebook in this folder uses) run against ``QNNModel``.
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset
 
 
 def freeze_untrainable(model):
@@ -62,3 +67,52 @@ def evaluate(model, loader, device):
             correct += (preds == y).sum().item()
             total += y.size(0)
     return correct / total
+
+
+def resize_images(images, img_size):
+    """images: (B, H, W) or (B, 1, H, W) uint8/float, any range -> (B, 1, img_size, img_size) in
+    [0, 1] float, matching `QNNModel`'s expected input (`Threshold_Encoder`'s `threshold=0.5` is
+    calibrated against raw `[0, 1]` pixel values, same as `generate_experiments.py`'s un-normalized
+    default transform).
+    """
+    x = images.reshape(images.size(0), 1, images.size(-2), images.size(-1)).float() / 255.
+    return F.interpolate(x, size=(img_size, img_size), mode='bilinear', align_corners=False)
+
+
+class RawImageDataset(Dataset):
+    """Wraps a medmnist ``(imgs, labels)`` numpy pair as a plain ``Dataset`` of raw 28x28 images.
+
+    Used to feed ``_handlers.evaluation.evaluate_all_metrics`` — it expects a ``Dataset`` of
+    ``(image, label)`` pairs, unlike ``train_quonv`` above which trains on already-resized
+    ``img_size x img_size`` tensors. Images stay uint8-range floats (0-255); ``QuonvLogits`` below
+    resizes and normalizes each batch, exactly like the training path.
+    """
+
+    def __init__(self, imgs, labels):
+        self.imgs = torch.as_tensor(imgs, dtype=torch.float32)
+        self.labels = torch.as_tensor(labels).reshape(-1).long()
+
+    def __len__(self):
+        return self.imgs.size(0)
+
+    def __getitem__(self, index):
+        return self.imgs[index], self.labels[index]
+
+
+class QuonvLogits(nn.Module):
+    """Adapts ``QNNModel`` to the ``evaluate_all_metrics`` contract: raw images in, logits out.
+
+    ``evaluate_all_metrics`` calls ``net(inputs).softmax(dim=-1)`` to recover class
+    probabilities; ``QNNModel`` already returns raw linear-head logits, so this only needs to
+    resize the native-resolution images down to the model's ``img_size`` first.
+    """
+
+    def __init__(self, model, img_size):
+        super().__init__()
+        self.model = model
+        self.img_size = img_size
+
+    def forward(self, images):
+        device = next(self.model.parameters()).device
+        x = resize_images(images, self.img_size).to(device)
+        return self.model(x).float()
