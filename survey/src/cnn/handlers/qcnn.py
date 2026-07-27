@@ -11,7 +11,9 @@ config in `takh04/QCNN`'s `result.py` and `Training.py`.
   `p[0] > p[1]` else `P=1`.
 """
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset
 
 
 def to_amplitude_states(images):
@@ -79,3 +81,42 @@ def train_qcnn(model, optimizer, train_x, train_y, test_x, test_y, steps, batch_
         test_acc = accuracy(test_probs, test_y.to(device))
     print(f'\nFinished training. test_accuracy: {test_acc:.4f}')
     return test_acc
+
+
+class RawImageDataset(Dataset):
+    """Wraps a medmnist ``(imgs, labels)`` numpy pair as a plain ``Dataset`` of raw 28x28 images.
+
+    Used to feed ``_handlers.evaluation.evaluate_all_metrics`` — it expects a ``Dataset`` of
+    ``(image, label)`` pairs, unlike ``train_qcnn`` above which trains on the pre-amplitude-encoded
+    tensors directly. Images stay uint8-range floats (0-255); ``QCNNLogits`` below runs
+    ``to_amplitude_states`` per batch, exactly like the training path.
+    """
+
+    def __init__(self, imgs, labels):
+        self.imgs = torch.as_tensor(imgs, dtype=torch.float64)
+        self.labels = torch.as_tensor(labels).reshape(-1).long()
+
+    def __len__(self):
+        return self.imgs.size(0)
+
+    def __getitem__(self, index):
+        return self.imgs[index], self.labels[index]
+
+
+class QCNNLogits(nn.Module):
+    """Adapts ``QCNN`` to the ``evaluate_all_metrics`` contract: raw images in, logits out.
+
+    ``evaluate_all_metrics`` calls ``net(inputs).softmax(dim=-1)`` to recover class
+    probabilities. ``QCNN.forward`` already returns normalized ``[P(0), P(1)]`` marginals, so
+    this wraps it as ``to_amplitude_states -> QCNN -> log(probs)``: softmax undoes the log and
+    reproduces the same probabilities exactly, letting the shared evaluation helper run unchanged.
+    """
+
+    def __init__(self, qcnn):
+        super().__init__()
+        self.qcnn = qcnn
+
+    def forward(self, images):
+        states = to_amplitude_states(images).to(next(self.qcnn.parameters()).device)
+        probs = self.qcnn(states)
+        return probs.clamp(min=1e-12, max=1.0).log().float()

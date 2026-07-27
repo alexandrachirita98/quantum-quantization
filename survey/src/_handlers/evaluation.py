@@ -260,12 +260,15 @@ def train_other(epochs, net, train_loader, test_loader, optimizer, scheduler, lo
 # --------------------------------------------------------------------------- #
 # Full evaluation (all metrics on one split)
 # --------------------------------------------------------------------------- #
-def evaluate_all_metrics(net, dataset, dataset_name, nb_classes, device, split='test', batch_size=48):
+def evaluate_all_metrics(net, dataset, dataset_name, nb_classes, device, split='test', batch_size=48, size=224):
     """Run ``net`` once over ``dataset`` and report every metric the two routines can produce.
 
     Prints the medmnist Evaluator AUC/ACC (for ``*mnist`` datasets) plus the full scikit-learn
     suite, and returns everything as a dict. The loader is unshuffled so predictions stay in
     split order (required by the medmnist Evaluator).
+
+    ``size`` selects which medmnist ``.npz`` resolution the Evaluator reads (``224`` for the timm
+    pipelines here, ``28`` — the native resolution — for e.g. the QCNN amplitude-encoding pipeline).
     """
     loader = data.DataLoader(dataset=dataset, batch_size=batch_size, shuffle=False)
 
@@ -285,7 +288,7 @@ def evaluate_all_metrics(net, dataset, dataset_name, nb_classes, device, split='
 
     # Official medmnist metrics (only for the *mnist datasets)
     if dataset_name.endswith('mnist'):
-        auc_mm, acc_mm = Evaluator(dataset_name, split, size=224, root='./data').evaluate(y_score)
+        auc_mm, acc_mm = Evaluator(dataset_name, split, size=size, root='./data').evaluate(y_score)
         results['medmnist_auc'], results['medmnist_acc'] = auc_mm, acc_mm
         print(f'[medmnist Evaluator]  auc: {auc_mm:.4f}  acc: {acc_mm:.4f}\n')
 
