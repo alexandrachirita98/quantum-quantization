@@ -46,9 +46,20 @@ original and is reproduced here in ``un_embed``.
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 FILTER_SIZE = 2
 N_FILTER_QUBITS = FILTER_SIZE * FILTER_SIZE   # one qubit per pixel of the 2x2 patch
+
+#: Budget (bytes) for the statevector intermediates autograd keeps alive across the whole
+#: quantum-conv layer. The simulation retains roughly one (patches, 2^n) complex128 tensor per gate
+#: per kernel, which for PCO-T (15 qubits, 33 gates, 3 kernels) is ~52 MB *per patch* -- 17 GB for
+#: the 324 patches of a single batch-of-4 step. When the layer would exceed this budget,
+#: `_MultiChannelCircuit` splits the patches into chunks and wraps each in `torch.utils.checkpoint`,
+#: so only one chunk's graph is ever live and the peak becomes the budget itself (at the cost of
+#: one extra forward pass per chunk). The 4- and 5-qubit variants fall under it and are untouched.
+#: Raise it to trade memory for speed on a larger GPU.
+STATE_MEMORY_BUDGET = 1 << 30   # 1 GiB
 
 
 # --------------------------------------------------------------------------- #
@@ -147,24 +158,32 @@ def _apply_controlled_1q_batch(state, gate1q, control, target, n_qubits):
     The gate acts as identity on the ``control=|0>`` half of the state, and as the 1-qubit
     ``gate1q`` on the ``target`` axis within the ``control=|1>`` half -- Cirq's positional
     convention, where the first qubit argument is the control.
+
+    The new half is built with `torch.stack` rather than by cloning the state and writing the two
+    ``control=|1>`` slices in place: the clone is a full extra (b, 2^n) tensor that autograd keeps
+    alive alongside the `index_put_` results, so the out-of-place form leaves roughly a third as
+    much on the tape per gate -- the difference between fitting and not at 15 qubits.
     """
     b = state.size(0)
     dim = 2 ** n_qubits
 
-    def sel(c_val, t_val):
-        idx = [slice(None)] * (1 + n_qubits)
-        idx[1 + control] = c_val
-        idx[1 + target] = t_val
-        return tuple(idx)
+    # split the wire axes as (before lo, lo, between, hi, after hi) so the two active qubits are
+    # addressable without materializing all n axes
+    lo, hi = min(control, target), max(control, target)
+    view = state.reshape(b, 2 ** lo, 2, 2 ** (hi - lo - 1), 2, 2 ** (n_qubits - hi - 1))
 
-    view = state.reshape(b, *([2] * n_qubits))
-    a0 = view[sel(1, 0)]
-    a1 = view[sel(1, 1)]
+    if control == lo:
+        c_axis, t_axis = 2, 3          # after selecting on `c_axis`, the target axis shifts down
+        rest0, rest1 = view[:, :, 0], view[:, :, 1]
+    else:
+        c_axis, t_axis = 4, 2
+        rest0, rest1 = view[:, :, :, :, 0], view[:, :, :, :, 1]
 
-    new_view = view.clone()
-    new_view[sel(1, 0)] = gate1q[0, 0] * a0 + gate1q[0, 1] * a1
-    new_view[sel(1, 1)] = gate1q[1, 0] * a0 + gate1q[1, 1] * a1
-    return new_view.reshape(b, dim)
+    a0 = rest1.select(t_axis, 0)
+    a1 = rest1.select(t_axis, 1)
+    gated = torch.stack([gate1q[0, 0] * a0 + gate1q[0, 1] * a1,
+                         gate1q[1, 0] * a0 + gate1q[1, 1] * a1], dim=t_axis)
+    return torch.stack([rest0, gated], dim=c_axis).reshape(b, dim)
 
 
 def un_embed(expectation):
@@ -208,6 +227,12 @@ class _MultiChannelCircuit(nn.Module):
         # [ancilla + r*4 .. ancilla + r*4 + 3]
         self.gate_schedule, self.n_params = self._build_gate_schedule()
 
+        # one full (patches, 2^n) intermediate is left on the autograd tape per embedded pixel
+        # (every channel is embedded once, on 4 wires) and per scheduled gate -- see
+        # `STATE_MEMORY_BUDGET`, which uses this to decide whether to chunk + checkpoint.
+        self.state_ops_per_kernel = (n_input_channels * N_FILTER_QUBITS
+                                     + self.circuit_layers * len(self.gate_schedule))
+
         self.kernel = nn.Parameter(_glorot_normal((n_kernels, 1, self.n_params)))
 
     def _register_wires(self, r):
@@ -226,29 +251,55 @@ class _MultiChannelCircuit(nn.Module):
         b, h, w, c = images.shape
         patches = extract_patches(images)   # (B, num_x, num_y, C, 2, 2)
         num_x, num_y = patches.shape[1], patches.shape[2]
-        pixels = patches.reshape(b, num_x, num_y, c, N_FILTER_QUBITS)   # last dim = 4 pixels/channel
+        # last dim = 4 pixels/channel; the (B, num_x, num_y) patch grid is flattened into one
+        # simulation batch, since every patch runs the same circuit independently
+        pixels = patches.reshape(b * num_x * num_y, c, N_FILTER_QUBITS)
 
-        device = images.device
         outputs = []
         for k in range(self.n_kernels):
-            state = self._run_circuit(pixels, self.kernel[k, 0], device)   # (B, num_x, num_y, 2^n)
-            expval = _pauli_op_expval(state, 0, pauli='X', n_qubits=self.n_qubits)
-            outputs.append(expval)
+            expval = self._chunked_expval(pixels, self.kernel[k, 0])   # (B * num_x * num_y,)
+            outputs.append(expval.reshape(b, num_x, num_y))
         stacked = torch.stack(outputs, dim=-1)   # (B, num_x, num_y, n_kernels)
         return un_embed(stacked)
 
-    def _run_circuit(self, pixels, kernel_params, device):
-        b, num_x, num_y = pixels.shape[0], pixels.shape[1], pixels.shape[2]
+    def _chunked_expval(self, pixels_flat, kernel_params):
+        """`<X> on ancilla 0` for every patch, simulated in chunks small enough to respect
+        `STATE_MEMORY_BUDGET`.
+
+        Patches are independent, so splitting them is exact -- the only thing chunking changes is
+        peak memory. Each chunk is run under `torch.utils.checkpoint`, which drops its statevector
+        intermediates after the forward pass and recomputes them during backward, so the graph of
+        at most one chunk is live at a time instead of `n_kernels * n_patches` worth. Under
+        `torch.no_grad()` (evaluation) there is no tape to speak of and the direct path is used.
+        """
+        n_patches = pixels_flat.size(0)
+        bytes_per_patch = self.state_ops_per_kernel * 2 ** self.n_qubits * 16   # complex128
+        grad = torch.is_grad_enabled() and kernel_params.requires_grad
+
+        if not grad or self.n_kernels * n_patches * bytes_per_patch <= STATE_MEMORY_BUDGET:
+            chunk = n_patches
+        else:
+            chunk = max(1, STATE_MEMORY_BUDGET // bytes_per_patch)
+
+        parts = []
+        for start in range(0, n_patches, chunk):
+            piece = pixels_flat[start:start + chunk]
+            if grad and chunk < n_patches:
+                parts.append(checkpoint(self._run_circuit, piece, kernel_params,
+                                        use_reentrant=False))
+            else:
+                parts.append(self._run_circuit(piece, kernel_params))
+        return torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+
+    def _run_circuit(self, pixels_flat, kernel_params):
+        """pixels_flat: (n_patches, n_input_channels, 4) -> (n_patches,) `<X>` on ancilla 0."""
         n = self.n_qubits
-        dim = 2 ** n
-        flat_b = b * num_x * num_y
+        n_patches = pixels_flat.size(0)
 
-        state = _uniform_ancilla_state(self.ancilla, self.registers, N_FILTER_QUBITS, device)
-        state = state.unsqueeze(0).expand(flat_b, dim).clone()
+        state = _uniform_ancilla_state(self.ancilla, self.registers, N_FILTER_QUBITS,
+                                       pixels_flat.device)
+        state = state.unsqueeze(0).expand(n_patches, 2 ** n).clone()
 
-        pixels_flat = pixels.reshape(flat_b, self.n_input_channels, N_FILTER_QUBITS)
-
-        param_iter = iter(kernel_params)
         for layer in range(self.circuit_layers):
             # embed
             for r in range(self.registers):
@@ -256,13 +307,13 @@ class _MultiChannelCircuit(nn.Module):
                 if ch >= self.n_input_channels:
                     continue
                 wires = self._register_wires(r)
-                angles = np.pi * pixels_flat[:, ch, :]   # (flat_b, 4)
+                angles = np.pi * pixels_flat[:, ch, :]   # (n_patches, 4)
                 state = _rx_embed_batch(state, angles, wires, n)
 
             # gate schedule for this layer: list of ('rx'-independent) ops already resolved to wires
             state = self._apply_schedule_ops(state, kernel_params, n)
 
-        return state.reshape(b, num_x, num_y, dim)
+        return _pauli_op_expval(state, 0, pauli='X', n_qubits=n)
 
     def _apply_schedule_ops(self, state, kernel_params, n):
         for op in self.gate_schedule:
@@ -280,42 +331,42 @@ def _glorot_normal(shape):
 
 
 def _uniform_ancilla_state(ancilla, registers, per_register, device):
-    """H on every ancilla wire, |0> elsewhere -- `cirq.H` applied before any embedding."""
+    """H on every ancilla wire, |0> elsewhere -- `cirq.H` applied before any embedding.
+
+    Written in closed form rather than by multiplying dense `_embed_1q(H, w, n)` matrices: the
+    result is just ``|+>^{ancilla} (x) |0...0>``, and with wire 0 the most significant bit (the
+    `_kron_n` convention) its only non-zero amplitudes sit at the basis states whose data qubits
+    are all zero -- every ``2^(n - ancilla)``-th index, each equal to ``2^(-ancilla/2)``.
+
+    The dense route allocated a ``(2^n, 2^n)`` complex128 matrix *per H*, which is 1 GB at the 13
+    qubits of the PCO variants and **17 GB** at the 15 of PCO-T -- an OOM before a single patch had
+    been simulated, independent of batch size.
+    """
     n = ancilla + registers * per_register
-    dim = 2 ** n
-    state = torch.zeros(dim, dtype=torch.complex128, device=device)
-    state[0] = 1.0
-    h = torch.tensor([[1, 1], [1, -1]], dtype=torch.complex128, device=device) / 2 ** 0.5
-    for w in range(ancilla):
-        state = _embed_1q(h, w, n) @ state
+    state = torch.zeros(2 ** n, dtype=torch.complex128, device=device)
+    state[::2 ** (n - ancilla)] = 2 ** (-ancilla / 2)
     return state
 
 
 def _rx_embed_batch(state, angles, wires, n_qubits):
     """Apply `rx(angles[:, i])` on `wires[i]` for every sample in the batch, in place-ish (no full
     per-sample unitary materialized -- same batched-per-wire trick as `qtransfer.py::ry_embed_batch`).
+
+    Same out-of-place `torch.stack` construction as `_apply_controlled_1q_batch` above, and for the
+    same reason: cloning the whole (b, 2^n) state per embedded pixel is what made the 15-qubit
+    PCO-T variants run out of memory.
     """
     b = state.size(0)
     dim = 2 ** n_qubits
     out = state
     for i, wire in enumerate(wires):
         theta = angles[:, i]
-        c = torch.cos(theta / 2).to(torch.complex128)
-        s = torch.sin(theta / 2).to(torch.complex128)
+        c = torch.cos(theta / 2).to(torch.complex128).reshape(b, 1, 1)
+        s = -1j * torch.sin(theta / 2).to(torch.complex128).reshape(b, 1, 1)
 
-        view = out.reshape(b, *([2] * n_qubits))
-        idx0 = (slice(None),) * (1 + wire) + (0,) + (slice(None),) * (n_qubits - wire - 1)
-        idx1 = (slice(None),) * (1 + wire) + (1,) + (slice(None),) * (n_qubits - wire - 1)
-        a0 = view[idx0]
-        a1 = view[idx1]
-
-        shape = [b] + [1] * (n_qubits - 1)
-        cc = c.reshape(shape)
-        ss = s.reshape(shape)
-        new_view = view.clone()
-        new_view[idx0] = cc * a0 - 1j * ss * a1
-        new_view[idx1] = -1j * ss * a0 + cc * a1
-        out = new_view.reshape(b, dim)
+        view = out.reshape(b, 2 ** wire, 2, 2 ** (n_qubits - wire - 1))
+        a0, a1 = view[:, :, 0], view[:, :, 1]
+        out = torch.stack([c * a0 + s * a1, s * a0 + c * a1], dim=2).reshape(b, dim)
     return out
 
 
