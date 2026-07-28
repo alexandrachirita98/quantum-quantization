@@ -133,6 +133,40 @@ def cz_pow(theta, control, target, n_qubits):
     return _embed_controlled_1q(z_pow(theta), control, target, n_qubits)
 
 
+def _apply_controlled_1q_batch(state, gate1q, control, target, n_qubits):
+    """Apply `_embed_controlled_1q(gate1q, control, target, n_qubits)` to a batch of statevectors
+    *without materializing the (2^n, 2^n) matrix* -- same batched-per-wire trick as
+    ``_rx_embed_batch``/``_pauli_op_expval`` above, and mathematically identical to
+    ``_embed_controlled_1q(...) @ state``.
+
+    This matters for the ``registers=3`` (PCO / PCO-T) circuits: those run on 13 and 15 qubits, so
+    one dense gate would be 8192^2 (1 GB) and 32768^2 (17 GB) complex128 respectively -- per gate,
+    per kernel, all retained by autograd for the backward pass. The control baselines stay on the
+    dense path since they are only 4 qubits (16x16).
+
+    The gate acts as identity on the ``control=|0>`` half of the state, and as the 1-qubit
+    ``gate1q`` on the ``target`` axis within the ``control=|1>`` half -- Cirq's positional
+    convention, where the first qubit argument is the control.
+    """
+    b = state.size(0)
+    dim = 2 ** n_qubits
+
+    def sel(c_val, t_val):
+        idx = [slice(None)] * (1 + n_qubits)
+        idx[1 + control] = c_val
+        idx[1 + target] = t_val
+        return tuple(idx)
+
+    view = state.reshape(b, *([2] * n_qubits))
+    a0 = view[sel(1, 0)]
+    a1 = view[sel(1, 1)]
+
+    new_view = view.clone()
+    new_view[sel(1, 0)] = gate1q[0, 0] * a0 + gate1q[0, 1] * a1
+    new_view[sel(1, 1)] = gate1q[1, 0] * a0 + gate1q[1, 1] * a1
+    return new_view.reshape(b, dim)
+
+
 def un_embed(expectation):
     """`arccos(clip(e, -1+1e-5, 1-1e-5)) / pi`, applied before the classical head in every
     circuit's `call()` in the original.
@@ -234,11 +268,8 @@ class _MultiChannelCircuit(nn.Module):
         for op in self.gate_schedule:
             kind, wire_a, wire_b, pidx = op
             theta = kernel_params[pidx]
-            if kind == 'cx':
-                U = cx_pow(theta, wire_a, wire_b, n)
-            else:
-                U = cz_pow(theta, wire_a, wire_b, n)
-            state = (U.unsqueeze(0) @ state.unsqueeze(-1)).squeeze(-1)
+            gate1q = x_pow(theta) if kind == 'cx' else z_pow(theta)
+            state = _apply_controlled_1q_batch(state, gate1q, wire_a, wire_b, n)
         return state
 
 
@@ -634,3 +665,122 @@ class MCQCNNModel(nn.Module):
 
 def conv_output_size(image_size, filter_size=FILTER_SIZE, stride=1):
     return (image_size - filter_size) // stride + 1
+
+
+# --------------------------------------------------------------------------- #
+# The ten trainable variants of `train.py`'s menu, one factory each
+# --------------------------------------------------------------------------- #
+# `models.py` ships eight assembly functions, but `train.py` offers ten menu entries: the two
+# `PCO_*_QCNN_model` functions are each called twice, with `rdpa=3` (PCO) and `rdpa=1` (PCO-T).
+# `rdpa` is "registers per ancilla" -- `ancilla = registers // rdpa` -- so with the fixed
+# `registers=3` those two settings mean 1 shared ancilla vs. 3 (one per channel register).
+#
+# Every model in `models.py` hardcodes `n_kernels=3` (`depth=3` for the U2 control), which is the
+# number of output feature maps of the quantum-conv layer.
+N_KERNELS = 3
+
+
+def _assemble(qconv, image_size, n_kernels, n_classes):
+    num = conv_output_size(image_size)
+    return MCQCNNModel(qconv, num_x=num, num_y=num, n_kernels=n_kernels, n_classes=n_classes)
+
+
+def CO_U1_QCNN(image_size, n_input_channels, n_classes):
+    """`models.py::CO_U1_QCNN_model` -- Channel Overwrite, U1 ansatz. One 4-qubit data register
+    reused across channels (`registers=1`), so each channel's angle encoding *overwrites* the
+    previous one's register state in a new `circuit_layer`; no inter-channel entangler.
+    """
+    qconv = U1Circuit(n_kernels=N_KERNELS, n_input_channels=n_input_channels)
+    return _assemble(qconv, image_size, N_KERNELS, n_classes)
+
+
+def PCO_U1_QCNN(image_size, n_input_channels, n_classes):
+    """`models.py::PCO_U1_QCNN_model(rdpa=3)` -- Partial Channel Overwrite, U1 ansatz. Three
+    parallel data registers (one per channel) entangled with each other in-circuit (`inter_U`),
+    depositing phase on a single shared ancilla.
+    """
+    qconv = U1Circuit(n_kernels=N_KERNELS, n_input_channels=n_input_channels,
+                      registers=3, rdpa=3, inter_U=True)
+    return _assemble(qconv, image_size, N_KERNELS, n_classes)
+
+
+def PCO_T_U1_QCNN(image_size, n_input_channels, n_classes):
+    """`models.py::PCO_U1_QCNN_model(rdpa=1)` -- the "tertiary" PCO, U1 ansatz. Same as `PCO_U1`
+    but with one ancilla *per* register (3 instead of 1), so the readout qubit is not a bottleneck.
+    """
+    qconv = U1Circuit(n_kernels=N_KERNELS, n_input_channels=n_input_channels,
+                      registers=3, rdpa=1, inter_U=True)
+    return _assemble(qconv, image_size, N_KERNELS, n_classes)
+
+
+def WEV_U1_QCNN(image_size, n_input_channels, n_classes):
+    """`models.py::QCNN_U1_weighted_control_model` -- Weighted Expectation Value, U1 ansatz. The
+    control circuit run once per channel, but combined with a *learned* per-position affine
+    reweight before the sum, instead of a plain sum.
+    """
+    num = conv_output_size(image_size)
+    qconv = QU1Control(n_kernels=N_KERNELS, n_input_channels=n_input_channels,
+                       classical_weights=True, num_x=num, num_y=num)
+    return _assemble(qconv, image_size, N_KERNELS, n_classes)
+
+
+def CONTROL_U1_QCNN(image_size, n_input_channels, n_classes):
+    """`models.py::QCNN_U1_control_model` -- the paper's non-multi-channel-aware baseline, U1
+    ansatz. A 4-qubit circuit run independently per channel with private parameters, combined by a
+    plain classical sum. This is "an existing QCNN" in the paper's comparisons.
+    """
+    qconv = QU1Control(n_kernels=N_KERNELS, n_input_channels=n_input_channels,
+                       classical_weights=False)
+    return _assemble(qconv, image_size, N_KERNELS, n_classes)
+
+
+def CO_U2_QCNN(image_size, n_input_channels, n_classes):
+    """`models.py::CO_U2_QCNN_model` -- Channel Overwrite, U2 ansatz (each `CXPowGate` of U1 is
+    joined by a `CZPowGate` on the same pair, doubling the parameters per entangling step).
+    """
+    qconv = U2Circuit(n_kernels=N_KERNELS, n_input_channels=n_input_channels)
+    return _assemble(qconv, image_size, N_KERNELS, n_classes)
+
+
+def PCO_U2_QCNN(image_size, n_input_channels, n_classes):
+    """`models.py::PCO_U2_QCNN_model(rdpa=3)` -- Partial Channel Overwrite, U2 ansatz."""
+    qconv = U2Circuit(n_kernels=N_KERNELS, n_input_channels=n_input_channels,
+                      registers=3, rdpa=3, inter_U=True)
+    return _assemble(qconv, image_size, N_KERNELS, n_classes)
+
+
+def PCO_T_U2_QCNN(image_size, n_input_channels, n_classes):
+    """`models.py::PCO_U2_QCNN_model(rdpa=1)` -- the "tertiary" PCO, U2 ansatz."""
+    qconv = U2Circuit(n_kernels=N_KERNELS, n_input_channels=n_input_channels,
+                      registers=3, rdpa=1, inter_U=True)
+    return _assemble(qconv, image_size, N_KERNELS, n_classes)
+
+
+def WEV_U2_QCNN(image_size, n_input_channels, n_classes):
+    """`models.py::QCNN_U2_weighted_control_model` -- Weighted Expectation Value, U2 ansatz."""
+    num = conv_output_size(image_size)
+    qconv = QU2Control(depth=N_KERNELS, n_input_channels=n_input_channels,
+                       classical_weights=True, num_x=num, num_y=num)
+    return _assemble(qconv, image_size, N_KERNELS, n_classes)
+
+
+def CONTROL_U2_QCNN(image_size, n_input_channels, n_classes):
+    """`models.py::QCNN_U2_control_model` -- the non-multi-channel-aware baseline, U2 ansatz."""
+    qconv = QU2Control(depth=N_KERNELS, n_input_channels=n_input_channels,
+                       classical_weights=False)
+    return _assemble(qconv, image_size, N_KERNELS, n_classes)
+
+
+#: `train.py`'s menu order, so a notebook can select a variant by name.
+VARIANTS = {
+    'CO_U1': CO_U1_QCNN,
+    'PCO_U1': PCO_U1_QCNN,
+    'PCO_T_U1': PCO_T_U1_QCNN,
+    'WEV_U1': WEV_U1_QCNN,
+    'CONTROL_U1': CONTROL_U1_QCNN,
+    'CO_U2': CO_U2_QCNN,
+    'PCO_U2': PCO_U2_QCNN,
+    'PCO_T_U2': PCO_T_U2_QCNN,
+    'WEV_U2': WEV_U2_QCNN,
+    'CONTROL_U2': CONTROL_U2_QCNN,
+}
